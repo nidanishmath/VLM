@@ -6,25 +6,25 @@ import matplotlib.pyplot as plt
 
 # Edge Updation
 class EdgeUpdateNet(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, d):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(3 * dim, dim),
+        self.net = nn.Sequential(
+            nn.Linear(3*d, d),
             nn.ReLU(),
-            nn.Linear(dim, dim)
+            nn.Linear(d, d)
         )
 
-    def forward(self, h_v_prev, h_u_prev, e_vu_prev):
-        return self.mlp(torch.cat([h_v_prev, h_u_prev, e_vu_prev], dim=-1))
+    def forward(self, h_v, h_u, e_vu):
+        return self.net(torch.cat([h_v, h_u, e_vu], dim=-1))
 
 # Downstream Node Updation
-class DownstreamNet(nn.Module):
-    def __init__(self, dim):
+class UpstreamNet(nn.Module):
+    def __init__(self, d):
         super().__init__()
-        self.fc = nn.Linear(3 * dim, dim)
+        self.net = nn.Linear(3*d, d)
 
     def forward(self, h0_v, h_prev_v, e_vu):
-        return self.fc(torch.cat([h0_v, h_prev_v, e_vu], dim=-1))
+        return self.net(torch.cat([h0_v, h_prev_v, e_vu], dim=-1))
 
 # Upstream Node Updation
 class UpstreamNet(nn.Module):
@@ -37,93 +37,122 @@ class UpstreamNet(nn.Module):
 
 # Node Updation
 class NodeUpdateNet(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, d):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(2 * dim, dim),
+        self.net = nn.Sequential(
+            nn.Linear(2*d, d),
             nn.ReLU(),
-            nn.Linear(dim, dim)
+            nn.Linear(d, d)
         )
 
     def forward(self, h_ds, h_us):
-        return self.fc(torch.cat([h_ds, h_us], dim=-1))
+        return self.net(torch.cat([h_ds, h_us], dim=-1))
 
 # Distance Proxy
-def node_distance(h):
-    return torch.norm(h, p=2)
+def path_distance(v, P_index):
+    return P_index[v]
 
-# Convergence Criterion
-def has_converged(prev_feats, curr_feats, eps=1e-4):
-    diffs = []
-    for v in curr_feats:
-        diffs.append(torch.norm(curr_feats[v] - prev_feats[v]))
-    return torch.mean(torch.stack(diffs)) < eps
+# Adjacency Network
+def adjacency_matrix(A, P):
+    idx = {v:i for i,v in enumerate(P)}
+    n = len(P)
+    M = torch.zeros((n, n), dtype=torch.int32)
+
+    for v in P:
+        i = idx[v]
+        for u in A["adjacency"][v]:
+            if u in idx:
+                j = idx[u]
+                M[i, j] = 1
+    return M
+
+# Convergence check
+def has_converged_adj(A_history, km):
+    if len(A_history) < km + 1:
+        return False
+
+    ne = A_history[-1].sum().item()
+    if ne == 0:
+        return True
+
+    sigma = 0
+    for j in range(-km+1, 0):
+        sigma += torch.bitwise_xor(
+            A_history[j],
+            A_history[j-1]
+        ).sum().item()
+
+    sigma = sigma / ne
+    return sigma == 0
+
 
 # NGF
 def NGF_scheme(
     A,
     P,
-    h0,
-    maxIteration=5,
+    maxIteration=10,
+    km=3,
     device="cuda"
 ):
     """
-    A : adjacency network
-    P : list of nodes
-    h0: initial node features {v: tensor}
+    Full NGF scheme exactly matching Algorithm 2 + Eqs (1)-(5)
     """
 
-    dim = next(iter(h0.values())).shape[-1]
+    # ---- setup ----
+    P = list(P)
+    P_index = {v:i for i,v in enumerate(P)}
 
-    Ne = EdgeUpdateNet(dim).to(device)
-    NDs = DownstreamNet(dim).to(device)
-    NUs = UpstreamNet(dim).to(device)
-    Nn = NodeUpdateNet(dim).to(device)
+    d = next(iter(A["node_features"].values())).shape[-1]
 
-    # initialize
+    Ne  = EdgeUpdateNet(d).to(device)
+    NDs = DownstreamNet(d).to(device)
+    NUs = UpstreamNet(d).to(device)
+    Nn  = NodeUpdateNet(d).to(device)
+
+    h0 = {v: A["node_features"][v].clone() for v in P}
+    h_prev = {v: h0[v].clone() for v in P}
+
+    A_history = []
     k = 1
-    hk_prev = {v: h0[v].clone() for v in P}
 
+    # ---- main loop ----
     while True:
+
         if k >= maxIteration:
             break
 
-        hk_curr = {}
+        # record adjacency matrix
+        A_history.append(adjacency_matrix(A, P))
+
+        h_curr = {}
 
         for v in P:
-            Psi_v = A["adjacency"][v]
+            hDs_v = torch.zeros(d, device=device)
+            hUs_v = torch.zeros(d, device=device)
 
-            hDs_v = torch.zeros(dim, device=device)
-            hUs_v = torch.zeros(dim, device=device)
+            for u in A["adjacency"][v]:
 
-            for u in Psi_v:
-                # ---- Edge update ----
-                e_prev = A["edge_features"][(v, u)]
-                e_k = Ne(
-                    hk_prev[v],
-                    hk_prev[u],
-                    e_prev
-                )
+                # Eq. (1): edge update
+                e_prev = A["edge_features"][(v,u)]
+                e_k = Ne(h_prev[v], h_prev[u], e_prev)
+                A["edge_features"][(v,u)] = e_k
 
-                A["edge_features"][(v, u)] = e_k
+                # path-based direction
+                if path_distance(u, P_index) < path_distance(v, P_index):
+                    hDs_v += NDs(h0[v], h_prev[v], e_k)
 
-                # ---- Directional aggregation ----
-                if node_distance(hk_prev[u]) < node_distance(hk_prev[v]):
-                    hDs_v += NDs(h0[v], hk_prev[v], e_k)
+                if path_distance(u, P_index) > path_distance(v, P_index):
+                    hUs_v += NUs(h0[v], h_prev[v], e_k)
 
-                if node_distance(hk_prev[u]) > node_distance(hk_prev[v]):
-                    hUs_v += NUs(h0[v], hk_prev[v], e_k)
+            # Eq. (4): node update
+            h_curr[v] = Nn(hDs_v, hUs_v)
+            A["node_features"][v] = h_curr[v]
 
-            # ---- Node update ----
-            hk_curr[v] = Nn(hDs_v, hUs_v)
-
-            A["node_features"][v] = hk_curr[v]
-
-        # ---- Convergence check ----
-        if has_converged(hk_prev, hk_curr):
+        # ---- convergence check (Eq. 5) ----
+        if has_converged_adj(A_history, km):
             break
 
-        hk_prev = hk_curr
+        h_prev = h_curr
         k += 1
 
     return A
