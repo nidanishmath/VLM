@@ -2,6 +2,7 @@ import cv2
 import torch
 import numpy as np
 import math
+import matplotlib.pyplot as plt
 
 # Mask Images
 def get_fundus_mask(img):
@@ -131,11 +132,16 @@ def show_segmentation(
     color=(0, 0, 255)
 ):
     img = cv2.imread(filename)
-    labels = labels.cpu().numpy()
-    mask = mask.cpu().numpy()
+
+    # Safe conversion (GPU / CPU)
+    if hasattr(labels, "cpu"):
+        labels = labels.cpu().numpy()
+    if hasattr(mask, "cpu"):
+        mask = mask.cpu().numpy()
 
     H, W = labels.shape
 
+    # Draw boundaries
     for y in range(1, H):
         valid = (labels[y] != labels[y-1]) & mask[y]
         img[y][valid] = color
@@ -144,5 +150,14 @@ def show_segmentation(
         valid = (labels[:, x] != labels[:, x-1]) & mask[:, x]
         img[:, x][valid] = color
 
+    # Save output
     cv2.imwrite(savename, img)
+
+    # ---- SHOW INLINE ----
+    plt.figure(figsize=(8, 8))
+    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.title("SLIC Segmentation Output")
+    plt.axis("off")
+    plt.show()
+
     return img
