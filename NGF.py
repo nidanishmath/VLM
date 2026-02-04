@@ -18,7 +18,7 @@ class EdgeUpdateNet(nn.Module):
         return self.net(torch.cat([h_v, h_u, e_vu], dim=-1))
 
 # Downstream Node Updation
-class UpstreamNet(nn.Module):
+class DownstreamNet(nn.Module):
     def __init__(self, d):
         super().__init__()
         self.net = nn.Linear(3*d, d)
