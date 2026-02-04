@@ -119,3 +119,66 @@ def construct_graph_A(image, labels, encoder, device="cuda"):
 
     return A
 
+# compute centroids
+def compute_centroids(labels):
+    centroids = {}
+    labels = labels.astype(np.int32)
+
+    for sp_id in np.unique(labels):
+        if sp_id < 0:
+            continue
+        ys, xs = np.where(labels == sp_id)
+        centroids[sp_id] = (int(xs.mean()), int(ys.mean()))
+    return centroids
+
+# visualization
+import matplotlib.pyplot as plt
+
+def visualize_graph_A(
+    image,
+    labels,
+    A,
+    node_size=20,
+    edge_thickness=1,
+    node_color="yellow",
+    edge_color="cyan"
+):
+    centroids = compute_centroids(labels)
+
+    vis = image.copy()
+
+    # ---- draw edges ----
+    for v, neighbors in A["adjacency"].items():
+        if v not in centroids:
+            continue
+        x1, y1 = centroids[v]
+        for u in neighbors:
+            if u not in centroids:
+                continue
+            x2, y2 = centroids[u]
+            cv2.line(
+                vis,
+                (x1, y1),
+                (x2, y2),
+                color=(255, 255, 0),  # cyan (BGR)
+                thickness=edge_thickness
+            )
+
+    # ---- draw nodes ----
+    for v, (x, y) in centroids.items():
+        cv2.circle(
+            vis,
+            (x, y),
+            radius=node_size // 2,
+            color=(0, 255, 255),  # yellow
+            thickness=-1
+        )
+
+    plt.figure(figsize=(8,8))
+    plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+    plt.title("Superpixel Graph A")
+    plt.show()
+
+    return vis
+
