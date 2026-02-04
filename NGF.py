@@ -1,15 +1,16 @@
+import cv2
 import torch
 import torch.nn as nn
 import numpy as np
-import cv2
 import matplotlib.pyplot as plt
 
-# Edge Updation
+# Edge Update
 class EdgeUpdateNet(nn.Module):
+    """ N_e^p : Eq. (1) """
     def __init__(self, d):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(3*d, d),
+            nn.Linear(3 * d, d),
             nn.ReLU(),
             nn.Linear(d, d)
         )
@@ -17,30 +18,33 @@ class EdgeUpdateNet(nn.Module):
     def forward(self, h_v, h_u, e_vu):
         return self.net(torch.cat([h_v, h_u, e_vu], dim=-1))
 
-# Downstream Node Updation
+# Downstream Node Update
 class DownstreamNet(nn.Module):
+    """ N_DS : Eq. (3) """
     def __init__(self, d):
         super().__init__()
-        self.net = nn.Linear(3*d, d)
+        self.net = nn.Linear(3 * d, d)
 
     def forward(self, h0_v, h_prev_v, e_vu):
         return self.net(torch.cat([h0_v, h_prev_v, e_vu], dim=-1))
 
-# Upstream Node Updation
+# Upstream Node Update
 class UpstreamNet(nn.Module):
-    def __init__(self, dim):
+    """ N_US : Eq. (2) """
+    def __init__(self, d):
         super().__init__()
-        self.fc = nn.Linear(3 * dim, dim)
+        self.net = nn.Linear(3 * d, d)
 
     def forward(self, h0_v, h_prev_v, e_vu):
-        return self.fc(torch.cat([h0_v, h_prev_v, e_vu], dim=-1))
+        return self.net(torch.cat([h0_v, h_prev_v, e_vu], dim=-1))
 
-# Node Updation
+# Node Update
 class NodeUpdateNet(nn.Module):
+    """ N_n^p : Eq. (4) """
     def __init__(self, d):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(2*d, d),
+            nn.Linear(2 * d, d),
             nn.ReLU(),
             nn.Linear(d, d)
         )
@@ -48,13 +52,25 @@ class NodeUpdateNet(nn.Module):
     def forward(self, h_ds, h_us):
         return self.net(torch.cat([h_ds, h_us], dim=-1))
 
-# Distance Proxy
-def path_distance(v, P_index):
-    return P_index[v]
+# Update adjacency
+def edge_strength(e_vu):
+    """ ||e_vu||_2 """
+    return torch.norm(e_vu, p=2)
 
-# Adjacency Network
+
+def update_adjacency(A, v, u, e_vu, tau):
+    """
+    Dynamic edge pruning based on edge embedding strength
+    """
+    if edge_strength(e_vu) < tau:
+        if u in A["adjacency"][v]:
+            A["adjacency"][v].remove(u)
+        if v in A["adjacency"][u]:
+            A["adjacency"][u].remove(v)
+
+
 def adjacency_matrix(A, P):
-    idx = {v:i for i,v in enumerate(P)}
+    idx = {v: i for i, v in enumerate(P)}
     n = len(P)
     M = torch.zeros((n, n), dtype=torch.int32)
 
@@ -66,41 +82,43 @@ def adjacency_matrix(A, P):
                 M[i, j] = 1
     return M
 
-# Convergence check
-def has_converged_adj(A_history, km):
-    if len(A_history) < km + 1:
+# Convergence
+def has_converged_adj(A_hist, km):
+    """
+    Eq. (5): XOR-based adjacency convergence
+    """
+    if len(A_hist) < km + 1:
         return False
 
-    ne = A_history[-1].sum().item()
+    ne = A_hist[-1].sum().item()
     if ne == 0:
         return True
 
     sigma = 0
-    for j in range(-km+1, 0):
+    for j in range(-km + 1, 0):
         sigma += torch.bitwise_xor(
-            A_history[j],
-            A_history[j-1]
+            A_hist[j],
+            A_hist[j - 1]
         ).sum().item()
 
     sigma = sigma / ne
     return sigma == 0
 
-
-# NGF
+# NGF Scheme
 def NGF_scheme(
     A,
     P,
     maxIteration=10,
     km=3,
+    tau=0.15,
     device="cuda"
 ):
     """
-    Full NGF scheme exactly matching Algorithm 2 + Eqs (1)-(5)
+    Complete NGF with dynamic adjacency
     """
 
-    # ---- setup ----
     P = list(P)
-    P_index = {v:i for i,v in enumerate(P)}
+    P_index = {v: i for i, v in enumerate(P)}
 
     d = next(iter(A["node_features"].values())).shape[-1]
 
@@ -109,46 +127,49 @@ def NGF_scheme(
     NUs = UpstreamNet(d).to(device)
     Nn  = NodeUpdateNet(d).to(device)
 
+    # Initial node embeddings h_v^0
     h0 = {v: A["node_features"][v].clone() for v in P}
     h_prev = {v: h0[v].clone() for v in P}
 
     A_history = []
     k = 1
 
-    # ---- main loop ----
     while True:
 
         if k >= maxIteration:
             break
 
-        # record adjacency matrix
+        # Record adjacency snapshot
         A_history.append(adjacency_matrix(A, P))
 
         h_curr = {}
 
         for v in P:
+
             hDs_v = torch.zeros(d, device=device)
             hUs_v = torch.zeros(d, device=device)
 
-            for u in A["adjacency"][v]:
+            for u in list(A["adjacency"][v]):
 
                 # Eq. (1): edge update
-                e_prev = A["edge_features"][(v,u)]
+                e_prev = A["edge_features"][(v, u)]
                 e_k = Ne(h_prev[v], h_prev[u], e_prev)
-                A["edge_features"][(v,u)] = e_k
+                A["edge_features"][(v, u)] = e_k
 
-                # path-based direction
-                if path_distance(u, P_index) < path_distance(v, P_index):
+                # Dynamic adjacency update (KEY)
+                update_adjacency(A, v, u, e_k, tau)
+
+                # Direction via path ordering
+                if P_index[u] < P_index[v]:
                     hDs_v += NDs(h0[v], h_prev[v], e_k)
-
-                if path_distance(u, P_index) > path_distance(v, P_index):
+                elif P_index[u] > P_index[v]:
                     hUs_v += NUs(h0[v], h_prev[v], e_k)
 
             # Eq. (4): node update
             h_curr[v] = Nn(hDs_v, hUs_v)
             A["node_features"][v] = h_curr[v]
 
-        # ---- convergence check (Eq. 5) ----
+        # Eq. (5): adjacency convergence
         if has_converged_adj(A_history, km):
             break
 
