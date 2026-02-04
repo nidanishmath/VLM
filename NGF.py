@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
 # Edge Updation
 class EdgeUpdateNet(nn.Module):
@@ -124,3 +127,78 @@ def NGF_scheme(
         k += 1
 
     return A
+
+# Compute centroids
+def compute_centroids(labels):
+    if isinstance(labels, torch.Tensor):
+        labels = labels.detach().cpu().numpy()
+
+    centroids = {}
+    for sp_id in np.unique(labels):
+        if sp_id < 0:
+            continue
+        ys, xs = np.where(labels == sp_id)
+        centroids[int(sp_id)] = (int(xs.mean()), int(ys.mean()))
+    return centroids
+
+# Visualization
+def visualize_A_updated(
+    image_path,
+    labels,
+    A,
+    savename,
+    node_radius=3,
+    edge_thickness=1,
+    node_color=(0, 255, 255),   # yellow
+    edge_color=(255, 255, 0)    # cyan
+):
+    image = cv2.imread(image_path)
+
+    # Safe conversion
+    if isinstance(labels, torch.Tensor):
+        labels = labels.detach().cpu().numpy()
+
+    centroids = compute_centroids(labels)
+    vis = image.copy()
+
+    # ---- Draw edges ----
+    for v, neighbors in A["adjacency"].items():
+        if v not in centroids:
+            continue
+        x1, y1 = centroids[v]
+
+        for u in neighbors:
+            if u not in centroids:
+                continue
+            x2, y2 = centroids[u]
+
+            cv2.line(
+                vis,
+                (x1, y1),
+                (x2, y2),
+                edge_color,
+                edge_thickness
+            )
+
+    # ---- Draw nodes ----
+    for v, (x, y) in centroids.items():
+        cv2.circle(
+            vis,
+            (x, y),
+            node_radius,
+            node_color,
+            -1
+        )
+
+    # ---- Save ----
+    cv2.imwrite(savename, vis)
+
+    # ---- Show inline ----
+    plt.figure(figsize=(8, 8))
+    plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+    plt.title("Updated Adjacency Network A (after NGF)")
+    plt.axis("off")
+    plt.show()
+
+    return vis
+
